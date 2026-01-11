@@ -1,0 +1,35 @@
+[package]
+name = "cdp-lite"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# The asynchronous runtime
+tokio = { version = "1.49.0", features = ["full"] }
+
+# WebSocket implementation with Tokio support
+tokio-tungstenite = { version = "0.28", features = ["native-tls"] }
+
+# Utilities for working with Streams and Sinks (essential for .split())
+futures-util = { version = "0.3.31", default-features = false, features = ["sink", "std"] }
+
+# JSON serialization/deserialization for CDP commands
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+
+# REST client for fetching the CDP metadata
+reqwest = { version = "0.13.1", features = ["json"] }
+thiserror = "2.0.17"
+
+# Logging
+tracing = "0.1.44"
+
+# Dispatcher
+oneshot = "0.1.11"
+
+tokio-stream = { version = "0.1.18", features = ["sync"] }
+log = "0.4.29"
+
+[dev-dependencies]
+tracing-subscriber = {  version = "0.3.22", features = ["env-filter"] }
+
