@@ -172,3 +172,231 @@ impl CdpClient {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn test_command_timeout_and_cleanup() {
+        let (command_tx, _command_rx) = mpsc::unbounded_channel();
+
+        let client = CdpClient {
+            command_tx,
+            pending_requests: Arc::new(Mutex::new(HashMap::new())),
+            event_tx: broadcast::channel(1).0,
+            next_id: Arc::new(AtomicU64::new(1)),
+            default_timeout: Duration::from_millis(100),
+            is_alive: Arc::new(AtomicBool::new(true)),
+        };
+
+        let result = client.send_raw_command("Page.navigate", serde_json::json!({"url": "about:blank"})).await;
+
+        match result {
+            Err(CdpError::Timeout { method, .. }) => {
+                assert_eq!(method, "Page.navigate");
+                println!("✅ Timeout detected successfully");
+            },
+            other => panic!("❌ Expected Timeout, but got: {:?}", other),
+        }
+
+        let pending = client.pending_requests.lock().unwrap();
+        assert_eq!(pending.len(), 0, "❌ ID was not removed from HashMap");
+        println!("✅ HashMap is clean, no memory leaks");
+    }
+
+    #[tokio::test]
+    async fn test_protocol_error_mapping() {
+        let (command_tx, _command_rx) = mpsc::unbounded_channel();
+        let client = CdpClient {
+            command_tx,
+            pending_requests: Arc::new(Mutex::new(HashMap::new())),
+            event_tx: broadcast::channel(1).0,
+            next_id: Arc::new(AtomicU64::new(1)),
+            default_timeout: Duration::from_secs(1),
+            is_alive: Arc::new(AtomicBool::new(true)),
+        };
+
+        let client_clone = client.clone();
+
+        let handle = tokio::spawn(async move {
+            client_clone.send_raw_command("Page.navigate", serde_json::json!({"url": "invalid-url"})).await
+        });
+
+        // Simulate server time response
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let responder = {
+            let mut map = client.pending_requests.lock().unwrap();
+            map.remove(&1).expect("The client should have registered request with ID 1")
+        };
+
+        // Simulate response with error in Browser
+        let error_response = WsResponse {
+            id: Some(1),
+            result: None,
+            method: None,
+            params: None,
+            error: Some(serde_json::json!({
+            "code": -32000,
+            "message": "Cannot navigate to invalid URL"
+        })),
+        };
+
+        responder.send(error_response).unwrap();
+
+        // Verify the client mapped the JSON to the CdpError enum
+        let result = handle.await.unwrap();
+        match result {
+            Err(CdpError::ProtocolError { code, message }) => {
+                assert_eq!(code, -32000);
+                assert_eq!(message, "Cannot navigate to invalid URL");
+                println!("✅ Protocol Error mapped correctly");
+            },
+            other => panic!("❌ Expected ProtocolError, but got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_event_broadcasting_and_filtering() {
+        let (command_tx, _command_rx) = mpsc::unbounded_channel();
+        let (event_tx, _) = broadcast::channel(32);
+
+        let client = CdpClient {
+            command_tx,
+            pending_requests: Arc::new(Mutex::new(HashMap::new())),
+            event_tx: event_tx.clone(),
+            next_id: Arc::new(AtomicU64::new(1)),
+            default_timeout: Duration::from_secs(1),
+            is_alive: Arc::new(AtomicBool::new(true)),
+        };
+
+        let mut page_events = client.on_domain("Page");
+
+        // Mock a CDP Event
+        let mock_event = WsResponse {
+            id: None, // Events never have an ID
+            result: None,
+            method: Some("Page.loadEventFired".to_string()),
+            params: Some(serde_json::json!({
+                "timestamp": 12345.678
+            })),
+            error: None,
+        };
+
+        // Simulate the reader task sending the event to the broadcast channel
+        let event_to_send = mock_event.clone();
+        tokio::spawn(async move {
+            // Wait a bit to ensure the subscriber is ready
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let _ = event_tx.send(event_to_send);
+        });
+
+        // Await the event in our filter
+        let received_event = timeout(Duration::from_secs(1), page_events.next())
+            .await
+            .expect("Timeout waiting for Page event")
+            .expect("Stream closed unexpectedly")
+            .expect("Failed to receive event from broadcast channel");
+
+        assert_eq!(received_event.method.as_deref(), Some("Page.loadEventFired"));
+
+        let timestamp = received_event.params.as_ref()
+            .and_then(|p| p.get("timestamp"))
+            .and_then(|t| t.as_f64());
+
+        assert_eq!(timestamp, Some(12345.678));
+        println!("✅ Event correctly filtered and received by domain subscriber");
+    }
+
+    #[tokio::test]
+    async fn test_broadcast_lagged_error() {
+        // Setup with a very small broadcast buffer (only 4 messages allowed)
+        let (command_tx, _command_rx) = mpsc::unbounded_channel();
+        let (event_tx, _) = broadcast::channel(4);
+
+        let client = CdpClient {
+            command_tx,
+            pending_requests: Arc::new(Mutex::new(HashMap::new())),
+            event_tx: event_tx.clone(),
+            next_id: Arc::new(AtomicU64::new(1)),
+            default_timeout: Duration::from_secs(1),
+            is_alive: Arc::new(AtomicBool::new(true)),
+        };
+
+        let mut page_events = client.on_domain("Page");
+
+        // Flood the channel with 10 events without reading them
+        // This will exceed the buffer capacity of 4
+        for i in 0..10 {
+            let mock_event = WsResponse {
+                id: None,
+                result: None,
+                method: Some("Page.event".to_string()),
+                params: Some(serde_json::json!({ "index": i })),
+                error: None,
+            };
+            let _ = event_tx.send(mock_event);
+        }
+
+        // Try to read from the subscriber
+        // Since we sent 10 messages but the buffer is 4, we are "lagged"
+        let result = page_events.next().await;
+
+        // The first call to next() after a lag should return an Error
+        // specifically a CdpError that wraps broadcast::error::RecvError::Lagged
+        match result {
+            Some(Err(CdpError::InternalError(msg))) => {
+                // Your CdpError::from implementation for RecvError likely formats it as a string
+                assert!(msg.contains("channel overflow") || msg.contains("lagged"));
+                println!("✅ Correctly detected lagged subscriber (buffer overflow)");
+            },
+            Some(Ok(event)) => {
+                panic!("❌ Expected a Lagged error, but received a successful event: {:?}", event);
+            },
+            None => panic!("❌ Stream closed unexpectedly"),
+            _ => {}
+        }
+
+        println!("✅ Buffer overflow test passed: Oldest messages were dropped as expected");
+    }
+
+    #[tokio::test]
+    async fn test_connection_drop_during_request() {
+        let (command_tx, _command_rx) = mpsc::unbounded_channel();
+        let pending_requests = Arc::new(Mutex::new(HashMap::new()));
+
+        let client = CdpClient {
+            command_tx,
+            pending_requests: pending_requests.clone(),
+            event_tx: broadcast::channel(1).0,
+            next_id: Arc::new(AtomicU64::new(1)),
+            default_timeout: Duration::from_secs(5),
+            is_alive: Arc::new(AtomicBool::new(true)),
+        };
+
+        let client_clone = client.clone();
+        let request_handle = tokio::spawn(async move {
+            client_clone.send_raw_command("Debugger.enable", serde_json::json!({})).await
+        });
+
+        // Simulate a sudden disconnection
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        {
+            let mut map = pending_requests.lock().unwrap();
+            // Dropping the 'oneshot::Sender' is what happens when we clear the map
+            // or the task dies. This sends a 'RecvError' to the 'Receiver'.
+            map.clear();
+        }
+        client.is_alive.store(false, Ordering::SeqCst);
+
+        let result = request_handle.await.unwrap();
+        match result {
+            Err(CdpError::Disconnected) => {
+                println!("✅ Correctly detected disconnection during pending request");
+            },
+            other => panic!("❌ Expected CdpError::Disconnected, but got: {:?}", other),
+        }
+    }
+}

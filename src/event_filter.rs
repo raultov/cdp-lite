@@ -33,10 +33,11 @@ impl Stream for EventFilter {
                     // Not the domain we want, loop again to poll next
                     continue;
                 }
-                Poll::Ready(Some(Err(_))) => {
+                Poll::Ready(Some(Err(e))) => {
                     // This 'Err' is specifically a BroadcastStreamRecvError::Lagged
-                    // We skip it to continue receiving the next fresh message
-                    continue;
+                    return Poll::Ready(Some(Err(crate::error::CdpError::InternalError(
+                        format!("Event stream lagged: {}", e)
+                    ))));
                 }
                 Poll::Ready(None) => return Poll::Ready(None), // Channel closed
                 Poll::Pending => return Poll::Pending,

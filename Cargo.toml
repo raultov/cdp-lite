@@ -2,23 +2,32 @@
 name = "cdp-lite"
 version = "0.1.0"
 edition = "2024"
+authors = ["Your Name <your.email@example.com>"]
+description = "A lightweight, asynchronous, and low-overhead Rust client for the Chrome DevTools Protocol (CDP)."
+readme = "README.md"
+repository = "https://github.com/raultov/cdp-lite"
+license = "MIT"
+keywords = ["cdp", "chrome", "automation", "devtools", "headless"]
+categories = ["asynchronous", "development-tools::debugging", "web-programming"]
+exclude = [".gitignore", "examples/*"]
 
 [dependencies]
-# The asynchronous runtime
+# Core async runtime
 tokio = { version = "1.49.0", features = ["full"] }
+tokio-stream = { version = "0.1.18", features = ["sync"] }
 
-# WebSocket implementation with Tokio support
+# WebSocket communication
 tokio-tungstenite = { version = "0.28", features = ["native-tls"] }
-
-# Utilities for working with Streams and Sinks (essential for .split())
 futures-util = { version = "0.3.31", default-features = false, features = ["sink", "std"] }
 
-# JSON serialization/deserialization for CDP commands
+# Serialization
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 
-# REST client for fetching the CDP metadata
+# HTTP client for fetching the WebSocket URL (if used in your rest_client)
 reqwest = { version = "0.13.1", features = ["json"] }
+
+# Error handling
 thiserror = "2.0.17"
 
 # Logging
@@ -27,7 +36,7 @@ tracing = "0.1.44"
 # Dispatcher
 oneshot = "0.1.11"
 
-tokio-stream = { version = "0.1.18", features = ["sync"] }
+# Logging & Tracing
 log = "0.4.29"
 
 [dev-dependencies]
