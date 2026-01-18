@@ -16,10 +16,7 @@ pub enum CdpError {
     NotFound,
 
     #[error("Command {method} timed out after {timeout:?}")]
-    Timeout {
-        method: String,
-        timeout: Duration,
-    },
+    Timeout { method: String, timeout: Duration },
 
     #[error("No suitable Chrome target found at host: {0}")]
     NoPageTargetFound(String),
@@ -28,10 +25,7 @@ pub enum CdpError {
     InternalError(String),
 
     #[error("Chrome returned an error (code {code}): {message}")]
-    ProtocolError {
-        code: i64,
-        message: String,
-    },
+    ProtocolError { code: i64, message: String },
 
     #[error("Connection lost")]
     Disconnected,

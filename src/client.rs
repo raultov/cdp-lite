@@ -1,20 +1,19 @@
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Duration;
+use crate::error::{CdpError, CdpResult};
+use crate::event_filter::EventFilter;
+use crate::protocol::{WsCommand, WsResponse};
+use crate::rest_client::get_websocket_url;
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
-use tokio::sync::broadcast;
 use tracing::{debug, error, trace};
-use crate::rest_client::get_websocket_url;
-use crate::error::{ CdpError, CdpResult };
-use crate::event_filter::EventFilter;
-use crate::protocol::{WsCommand, WsResponse};
-
 
 #[derive(Clone)]
 pub struct CdpClient {
@@ -33,7 +32,9 @@ impl CdpClient {
         let (ws_stream, _) = connect_async(ws_url).await?;
         let (mut ws_sink, mut ws_stream) = ws_stream.split();
 
-        let pending_requests = Arc::new(Mutex::new(HashMap::<u64, oneshot::Sender<WsResponse>>::new()));
+        let pending_requests = Arc::new(Mutex::new(
+            HashMap::<u64, oneshot::Sender<WsResponse>>::new(),
+        ));
         let pending_requests_clone = Arc::clone(&pending_requests);
 
         let (command_tx, mut command_rx) = mpsc::unbounded_channel::<String>();
@@ -51,7 +52,8 @@ impl CdpClient {
                     ws_sink.send(Message::Text(json_str.into())).await?;
                 }
                 Ok(())
-            }.await;
+            }
+            .await;
 
             if let Err(e) = result {
                 error!("Fatal error in CDP Writer task: {}", e);
@@ -67,8 +69,12 @@ impl CdpClient {
                         let response: WsResponse = serde_json::from_str(&received_text)?;
 
                         if let Some(id) = response.id {
-                            let mut map = pending_requests_clone.lock()
-                                .map_err(|_| CdpError::InternalError("Could not acquire mutex lock on pending requests cloned map".to_string()))?;
+                            let mut map = pending_requests_clone.lock().map_err(|_| {
+                                CdpError::InternalError(
+                                    "Could not acquire mutex lock on pending requests cloned map"
+                                        .to_string(),
+                                )
+                            })?;
 
                             if let Some(responder) = map.remove(&id) {
                                 trace!("Received expected id {} from CDP", id);
@@ -80,12 +86,16 @@ impl CdpClient {
                             trace!("CDP Event: {}", method);
                             let _ = event_tx_clone.send(response.clone());
                         } else {
-                            debug!("Received unexpected message from CDP (no id, no method): {}", received_text);
+                            debug!(
+                                "Received unexpected message from CDP (no id, no method): {}",
+                                received_text
+                            );
                         }
                     }
                 }
                 Ok(())
-            }.await;
+            }
+            .await;
 
             is_alive_reader.store(false, Ordering::SeqCst);
 
@@ -95,7 +105,10 @@ impl CdpClient {
             }
 
             if let Ok(mut map) = pending_requests_clone.lock() {
-                debug!("Closing {} pending requests due to disconnection", map.len());
+                debug!(
+                    "Closing {} pending requests due to disconnection",
+                    map.len()
+                );
                 map.clear(); // Dropping the 'oneshot' senders sends an Err to the receivers
             }
         });
@@ -119,7 +132,11 @@ impl CdpClient {
         EventFilter::new(self.subscribe(), domain)
     }
 
-    pub async fn send_raw_command<P: Serialize>(&self, method: &str, params: P) -> CdpResult<WsResponse> {
+    pub async fn send_raw_command<P: Serialize>(
+        &self,
+        method: &str,
+        params: P,
+    ) -> CdpResult<WsResponse> {
         if !self.is_alive.load(Ordering::SeqCst) {
             return Err(CdpError::Disconnected);
         }
@@ -128,39 +145,42 @@ impl CdpClient {
         let (tx, rx) = oneshot::channel();
 
         {
-            let mut map = self.pending_requests.lock()
-                .map_err(|_| CdpError::InternalError("Mutex poisoned: another thread panicked while holding the lock".into()))?;
+            let mut map = self.pending_requests.lock().map_err(|_| {
+                CdpError::InternalError(
+                    "Mutex poisoned: another thread panicked while holding the lock".into(),
+                )
+            })?;
             map.insert(id, tx);
         }
 
         let cmd = WsCommand {
-          id,
-          method: method.to_string(),
-          params: Some(params),
+            id,
+            method: method.to_string(),
+            params: Some(params),
         };
 
         let json_payload = serde_json::to_string(&cmd)?;
-        self.command_tx.send(json_payload)
-            .map_err(|e| {
-                self.is_alive.store(false, Ordering::SeqCst);
-                CdpError::InternalError(format!("Failed to send command to writer task: {}", e))
-            })?;
+        self.command_tx.send(json_payload).map_err(|e| {
+            self.is_alive.store(false, Ordering::SeqCst);
+            CdpError::InternalError(format!("Failed to send command to writer task: {}", e))
+        })?;
 
         match timeout(self.default_timeout, rx).await {
             Ok(Ok(response)) => {
                 if let Some(error_obj) = response.error {
                     return Err(CdpError::ProtocolError {
                         code: error_obj["code"].as_i64().unwrap_or(-1),
-                        message: error_obj["message"].as_str().unwrap_or("Unknown CDP error").to_string(),
-                    })
+                        message: error_obj["message"]
+                            .as_str()
+                            .unwrap_or("Unknown CDP error")
+                            .to_string(),
+                    });
                 }
                 Ok(response)
-            },
-            Ok(Err(_)) => {
-                Err(CdpError::Disconnected)
-            },
+            }
+            Ok(Err(_)) => Err(CdpError::Disconnected),
             Err(_) => {
-                if let Ok (mut map) = self.pending_requests.lock() {
+                if let Ok(mut map) = self.pending_requests.lock() {
                     map.remove(&id);
                 }
 
@@ -191,13 +211,15 @@ mod tests {
             is_alive: Arc::new(AtomicBool::new(true)),
         };
 
-        let result = client.send_raw_command("Page.navigate", serde_json::json!({"url": "about:blank"})).await;
+        let result = client
+            .send_raw_command("Page.navigate", serde_json::json!({"url": "about:blank"}))
+            .await;
 
         match result {
             Err(CdpError::Timeout { method, .. }) => {
                 assert_eq!(method, "Page.navigate");
                 println!("✅ Timeout detected successfully");
-            },
+            }
             other => panic!("❌ Expected Timeout, but got: {:?}", other),
         }
 
@@ -221,7 +243,9 @@ mod tests {
         let client_clone = client.clone();
 
         let handle = tokio::spawn(async move {
-            client_clone.send_raw_command("Page.navigate", serde_json::json!({"url": "invalid-url"})).await
+            client_clone
+                .send_raw_command("Page.navigate", serde_json::json!({"url": "invalid-url"}))
+                .await
         });
 
         // Simulate server time response
@@ -229,7 +253,8 @@ mod tests {
 
         let responder = {
             let mut map = client.pending_requests.lock().unwrap();
-            map.remove(&1).expect("The client should have registered request with ID 1")
+            map.remove(&1)
+                .expect("The client should have registered request with ID 1")
         };
 
         // Simulate response with error in Browser
@@ -239,9 +264,9 @@ mod tests {
             method: None,
             params: None,
             error: Some(serde_json::json!({
-            "code": -32000,
-            "message": "Cannot navigate to invalid URL"
-        })),
+                "code": -32000,
+                "message": "Cannot navigate to invalid URL"
+            })),
         };
 
         responder.send(error_response).unwrap();
@@ -253,7 +278,7 @@ mod tests {
                 assert_eq!(code, -32000);
                 assert_eq!(message, "Cannot navigate to invalid URL");
                 println!("✅ Protocol Error mapped correctly");
-            },
+            }
             other => panic!("❌ Expected ProtocolError, but got: {:?}", other),
         }
     }
@@ -300,9 +325,14 @@ mod tests {
             .expect("Stream closed unexpectedly")
             .expect("Failed to receive event from broadcast channel");
 
-        assert_eq!(received_event.method.as_deref(), Some("Page.loadEventFired"));
+        assert_eq!(
+            received_event.method.as_deref(),
+            Some("Page.loadEventFired")
+        );
 
-        let timestamp = received_event.params.as_ref()
+        let timestamp = received_event
+            .params
+            .as_ref()
             .and_then(|p| p.get("timestamp"))
             .and_then(|t| t.as_f64());
 
@@ -351,10 +381,13 @@ mod tests {
                 // Your CdpError::from implementation for RecvError likely formats it as a string
                 assert!(msg.contains("channel overflow") || msg.contains("lagged"));
                 println!("✅ Correctly detected lagged subscriber (buffer overflow)");
-            },
+            }
             Some(Ok(event)) => {
-                panic!("❌ Expected a Lagged error, but received a successful event: {:?}", event);
-            },
+                panic!(
+                    "❌ Expected a Lagged error, but received a successful event: {:?}",
+                    event
+                );
+            }
             None => panic!("❌ Stream closed unexpectedly"),
             _ => {}
         }
@@ -378,7 +411,9 @@ mod tests {
 
         let client_clone = client.clone();
         let request_handle = tokio::spawn(async move {
-            client_clone.send_raw_command("Debugger.enable", serde_json::json!({})).await
+            client_clone
+                .send_raw_command("Debugger.enable", serde_json::json!({}))
+                .await
         });
 
         // Simulate a sudden disconnection
@@ -395,7 +430,7 @@ mod tests {
         match result {
             Err(CdpError::Disconnected) => {
                 println!("✅ Correctly detected disconnection during pending request");
-            },
+            }
             other => panic!("❌ Expected CdpError::Disconnected, but got: {:?}", other),
         }
     }

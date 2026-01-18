@@ -1,7 +1,6 @@
-use serde::Deserialize;
-use reqwest;
-use tracing::debug;
 use crate::error::{CdpError, CdpResult};
+use serde::Deserialize;
+use tracing::debug;
 
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
@@ -15,10 +14,7 @@ pub struct ChromeTarget {
 pub async fn get_websocket_url(host: &str) -> CdpResult<String> {
     let url = format!("http://{}/json/list", host);
 
-    let targets: Vec<ChromeTarget> = reqwest::get(&url)
-        .await?
-        .json()
-        .await?;
+    let targets: Vec<ChromeTarget> = reqwest::get(&url).await?.json().await?;
 
     let target = targets
         .into_iter()

@@ -1,6 +1,6 @@
 [package]
 name = "cdp-lite"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 authors = ["Raul Tovar <raultov@protonmail.com>"]
 description = "A lightweight, asynchronous, and low-overhead Rust client for the Chrome DevTools Protocol (CDP)."
