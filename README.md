@@ -55,6 +55,15 @@ async fn main() -> CdpResult<()> {
     Ok(())
 }
 ```
+---
+
+## 📂 Advanced examples
+
+You can find complete, ready-to-run examples in the [examples/](https://github.com/raultov/cdp-lite/tree/master/examples) directory:
+* `breakpoints_usage.rs`: Basic breakpoints in JavaScript upon execution (Debugger domain).
+* `filter_domains.rs`: How to subscribe to different browser events.
+* `runtime_usage.rs`: Using the Runtime domain.
+* `proxy_usage.rs`: Authenticating the browser against a Proxy Server.
 
 ---
 
