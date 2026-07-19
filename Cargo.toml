@@ -41,4 +41,5 @@ log = "0.4.29"
 
 [dev-dependencies]
 tracing-subscriber = {  version = "0.3.22", features = ["env-filter"] }
+wiremock = "0.6"
 
