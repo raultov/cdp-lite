@@ -53,32 +53,30 @@ async fn main() -> CdpResult<()> {
                                     json!({"scriptId": script_id}),
                                 )
                                 .await
-                            {
-                                if let Some((line_number, column_number)) =
+                                && let Some((line_number, column_number)) =
                                     extract_from_value(&script_result.result, "scriptSource")
                                         .and_then(|s| find_line_column(s, "nav_dropdown.value"))
-                                {
-                                    let hash = extract_from_value(&event.params, "hash")
-                                        .ok_or_else(|| {
-                                            CdpError::InternalError("Hash Id not found".to_string())
-                                        })?;
+                            {
+                                let hash =
+                                    extract_from_value(&event.params, "hash").ok_or_else(|| {
+                                        CdpError::InternalError("Hash Id not found".to_string())
+                                    })?;
 
-                                    cdp_client_clone
-                                        .send_raw_command(
-                                            "Debugger.setBreakpointByUrl",
-                                            json!({
-                                                "lineNumber": line_number,
-                                                "columnNumber": column_number,
-                                                "scriptHash": hash
-                                            }),
-                                        )
-                                        .await?;
+                                cdp_client_clone
+                                    .send_raw_command(
+                                        "Debugger.setBreakpointByUrl",
+                                        json!({
+                                            "lineNumber": line_number,
+                                            "columnNumber": column_number,
+                                            "scriptHash": hash
+                                        }),
+                                    )
+                                    .await?;
 
-                                    target_found = true;
-                                    cdp_client_clone
-                                        .send_raw_command("Page.reload", NoParams)
-                                        .await?;
-                                }
+                                target_found = true;
+                                cdp_client_clone
+                                    .send_raw_command("Page.reload", NoParams)
+                                    .await?;
                             }
                         }
                         "Debugger.paused" => {
