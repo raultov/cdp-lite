@@ -11,6 +11,13 @@ pub struct ChromeTarget {
     pub web_socket_debugger_url: String,
 }
 
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+struct BrowserVersion {
+    #[serde(default)]
+    web_socket_debugger_url: String,
+}
+
 pub async fn get_websocket_url(host: &str) -> CdpResult<String> {
     let url = format!("http://{}/json/list", host);
 
@@ -21,6 +28,32 @@ pub async fn get_websocket_url(host: &str) -> CdpResult<String> {
     debug!("Found target: {} - {}", target.title, target.url);
 
     Ok(target.web_socket_debugger_url.clone())
+}
+
+/// Resolves the browser-level WebSocket endpoint from `GET /json/version`.
+///
+/// Unlike [`get_websocket_url`], this endpoint is not bound to any page. It is
+/// the connection used to drive the `Target` domain, which is what makes it
+/// possible to attach to several tabs over a single socket.
+///
+/// Chrome omits `webSocketDebuggerUrl` when remote debugging is exposed
+/// through certain proxies, so an empty value is treated as "no usable
+/// target at this host".
+pub async fn get_browser_websocket_url(host: &str) -> CdpResult<String> {
+    let url = format!("http://{}/json/version", host);
+
+    let version: BrowserVersion = reqwest::get(&url).await?.json().await?;
+
+    if version.web_socket_debugger_url.is_empty() {
+        return Err(CdpError::NoPageTargetFound(host.to_string()));
+    }
+
+    debug!(
+        "Found browser endpoint: {}",
+        version.web_socket_debugger_url
+    );
+
+    Ok(version.web_socket_debugger_url)
 }
 
 /// Picks the best target to attach to from a `GET /json/list` response.
@@ -256,6 +289,44 @@ mod tests {
                 .await
                 .expect("happy path should still work");
             assert_eq!(ws, "ws://example");
+        }
+
+        async fn json_version_endpoint(server: &MockServer, body: &str) -> String {
+            Mock::given(method("GET"))
+                .and(path("/json/version"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(body))
+                .mount(server)
+                .await;
+            server.address().to_string()
+        }
+
+        #[tokio::test]
+        async fn get_browser_websocket_url_returns_browser_endpoint() {
+            let server = MockServer::start().await;
+            let body = r#"{"Browser":"Chrome/120.0","webSocketDebuggerUrl":"ws://host/devtools/browser/abc"}"#;
+            let host = json_version_endpoint(&server, body).await;
+
+            let ws = get_browser_websocket_url(&host)
+                .await
+                .expect("browser endpoint should be resolved");
+
+            assert_eq!(ws, "ws://host/devtools/browser/abc");
+        }
+
+        #[tokio::test]
+        async fn get_browser_websocket_url_errors_when_endpoint_missing() {
+            let server = MockServer::start().await;
+            let body = r#"{"Browser":"Chrome/120.0"}"#;
+            let host = json_version_endpoint(&server, body).await;
+
+            let err = get_browser_websocket_url(&host)
+                .await
+                .expect_err("a missing endpoint must not yield an empty URL");
+
+            assert!(
+                matches!(err, CdpError::NoPageTargetFound(_)),
+                "expected NoPageTargetFound, got {err:?}",
+            );
         }
     }
 }
