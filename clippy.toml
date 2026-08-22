@@ -1,0 +1,16 @@
+# Set the maximum number of arguments a function can have.
+# The default value is 7.
+too-many-arguments-threshold = 4
+
+# Set the maximum number of lines for a single function.
+# The default value is 100.
+too-many-lines-threshold = 50
+
+# clippy.toml
+# Lower the cognitive complexity threshold (default is 25)
+# A value of 10 or 15 forces developers to split complex logic into smaller functions
+cognitive-complexity-threshold = 15
+
+# clippy.toml
+# Maximum allowed complexity for a type (default is 250)
+type-complexity-threshold = 150
