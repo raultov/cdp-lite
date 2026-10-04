@@ -1,7 +1,8 @@
-use crate::error::CdpResult;
+use crate::error::{CdpError, CdpResult};
 use crate::protocol::WsResponse;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 use tokio_stream::{Stream, wrappers::BroadcastStream};
 
 pub struct EventFilter {
@@ -80,12 +81,12 @@ impl Stream for EventFilter {
                     // Not what this subscriber wants, loop again to poll next
                     continue;
                 }
-                Poll::Ready(Some(Err(e))) => {
-                    // This 'Err' is specifically a BroadcastStreamRecvError::Lagged
-                    return Poll::Ready(Some(Err(crate::error::CdpError::InternalError(format!(
-                        "Event stream lagged: {}",
-                        e
-                    )))));
+                Poll::Ready(Some(Err(BroadcastStreamRecvError::Lagged(skipped)))) => {
+                    // The channel overran this subscriber: `skipped` events were
+                    // dropped and this filter never sees them. Surfaced as a typed
+                    // error so consumers can resynchronise whatever cache those
+                    // events were maintaining instead of silently going stale.
+                    return Poll::Ready(Some(Err(CdpError::Lagged { skipped })));
                 }
                 Poll::Ready(None) => return Poll::Ready(None), // Channel closed
                 Poll::Pending => return Poll::Pending,
@@ -177,5 +178,89 @@ mod tests {
             collect_methods(filter, 2).await,
             vec!["Page.loadEventFired", "Runtime.consoleAPICalled"],
         );
+    }
+
+    /// Overrunning the ring must surface a typed `Lagged` carrying the number
+    /// of dropped events: consumers key their state resynchronisation off it,
+    /// so it cannot be an opaque `InternalError`.
+    #[tokio::test]
+    async fn overflowing_the_ring_reports_a_typed_lagged_error() {
+        let (tx, rx) = broadcast::channel(2);
+        let mut filter = EventFilter::new(rx, "Page");
+
+        // Overrun the 2-slot ring before the filter reads anything.
+        for i in 0..5 {
+            let _ = tx.send(event(&format!("Page.e{i}"), None));
+        }
+        drop(tx);
+
+        let first = filter
+            .next()
+            .await
+            .expect("stream must stay open across a lag")
+            .expect_err("a lag must surface as an error, not as an event");
+
+        match first {
+            CdpError::Lagged { skipped } => {
+                assert!(skipped > 0, "at least one event must have been dropped")
+            }
+            other => panic!("expected CdpError::Lagged, got {other:?}"),
+        }
+    }
+
+    /// A lag must not end the stream: the filter keeps forwarding what it did
+    /// not miss, which is what makes recovery possible after the fact.
+    #[tokio::test]
+    async fn filter_keeps_working_after_a_lag() {
+        let (tx, rx) = broadcast::channel(2);
+        let mut filter = EventFilter::new(rx, "Page");
+
+        for i in 0..5 {
+            let _ = tx.send(event(&format!("Page.e{i}"), None));
+        }
+        drop(tx);
+
+        // Consume the lag notification first.
+        filter
+            .next()
+            .await
+            .expect("stream must stay open")
+            .expect_err("the lag is reported before anything else");
+
+        let mut rest = Vec::new();
+        while let Some(item) = filter.next().await {
+            let response = item.expect("no further errors after the lag");
+            rest.push(response.method.expect("events always carry a method"));
+        }
+
+        assert_eq!(
+            rest.last().map(String::as_str),
+            Some("Page.e4"),
+            "the newest events must survive: {rest:?}"
+        );
+        assert!(
+            rest.len() <= 2,
+            "a 2-slot ring cannot hand back more than 2 events: {rest:?}"
+        );
+    }
+
+    /// The dropped count is the payload consumers need, so it must survive the
+    /// conversion from `BroadcastStreamRecvError`.
+    #[tokio::test]
+    async fn lagged_error_reports_how_many_events_were_dropped() {
+        let (tx, rx) = broadcast::channel(4);
+        let mut filter = EventFilter::new(rx, "WebMCP");
+
+        // 12 sends into a 4-slot ring: the reader misses 8.
+        for i in 0..12 {
+            let _ = tx.send(event(&format!("WebMCP.e{i}"), None));
+        }
+        drop(tx);
+
+        let first = filter.next().await.unwrap().unwrap_err();
+        let CdpError::Lagged { skipped } = first else {
+            panic!("expected CdpError::Lagged, got {first:?}");
+        };
+        assert_eq!(skipped, 8, "12 sent into a 4-slot ring drops 8");
     }
 }

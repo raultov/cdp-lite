@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-04
+
+### Added
+
+- `CdpError::Lagged { skipped: u64 }` — a typed signal carrying how many events
+  a subscriber missed because it fell behind the event channel. A consumer that
+  caches event-derived state can key a resynchronisation off it instead of
+  trusting a cache that is silently stale.
+- `CdpClient::connect_with_capacity` / `BrowserClient::connect_with_capacity`
+  and the `client::EVENT_CHANNEL_CAPACITY` constant (4096), so a session driving
+  many tabs can size the shared event ring explicitly.
+
+### Changed
+
+- **Breaking:** `CdpError` is now `#[non_exhaustive]`. Match with a wildcard arm
+  and adding variants will stop being a breaking change.
+- **Breaking:** an event-stream lag is reported as `CdpError::Lagged` rather than
+  `CdpError::InternalError` with a formatted string. Consumers that matched on
+  the error text must switch to matching the variant.
+- The default event channel grew from 128 to `EVENT_CHANNEL_CAPACITY` (4096).
+  Measured on a real Chrome 153 session, a single tab emits only ~130 events per
+  navigation, so the old size never overflowed there — but the ring is shared by
+  **every** tab and domain of one connection, so 128 was sized for a page rather
+  than for a browser session. This is headroom, not a fix.
+- A lagged subscriber keeps working: it is handed the dropped count and then
+  keeps receiving everything it did not miss.
+
+### Fixed
+
+- `test_broadcast_lagged_error` asserted on error text through a `match` with a
+  catch-all arm, so it passed for every error variant including unrelated ones.
+  It now asserts the typed `Lagged` and the exact dropped count.
+
 ## [0.2.0] - 2026-08-22
 
 ### Added
@@ -76,7 +109,8 @@ First published release.
 - Usage examples: `simple`, `filter_domains`, `runtime_usage`,
   `breakpoints_usage`, `proxy_usage`.
 
-[Unreleased]: https://github.com/raultov/cdp-lite/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/raultov/cdp-lite/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/raultov/cdp-lite/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/raultov/cdp-lite/compare/v0.1.3...v0.2.0
 [0.1.3]: https://github.com/raultov/cdp-lite/compare/v0.1.1...v0.1.3
 [0.1.1]: https://github.com/raultov/cdp-lite/releases/tag/v0.1.1

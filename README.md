@@ -104,6 +104,7 @@ docs.close().await?;    // or browser.close_tab(id)
 | Method | Purpose |
 | --- | --- |
 | `BrowserClient::connect(host, timeout)` | Connect to the browser endpoint (`/json/version`) |
+| `BrowserClient::connect_with_capacity(host, timeout, cap)` | Same, with an explicit event-ring size |
 | `list_tabs()` / `list_targets()` | Enumerate tabs (or every target) |
 | `attach(target_id)` / `attach_to_all_tabs()` | Get a `Tab` for existing tabs |
 | `new_tab(url)` / `close_tab(target_id)` | Open and close tabs |
@@ -133,6 +134,25 @@ tokio::spawn(async move {
     }
 });
 ```
+
+### Event loss and `CdpError::Lagged`
+
+One connection carries the events of every domain of every attached tab through
+a single ring (`client::EVENT_CHANNEL_CAPACITY`, 4096 by default; raise it with
+`connect_with_capacity` when driving many tabs). If a listener falls behind, the
+events it could not read are **dropped** and the stream yields:
+
+```rust
+CdpError::Lagged { skipped: 6 }
+```
+
+The listener then keeps working and receives everything it did not miss. Nothing
+is discarded silently: `skipped` is exactly how many events went missing.
+
+If your listener maintains a cache of event-derived state (a tool registry, a
+request log, ...), treat `Lagged` as "that cache is now incomplete" and rebuild
+it from the source — for example by re-sending the domain's `*.enable` command,
+which makes Chrome replay its authoritative state.
 
 ---
 

@@ -78,6 +78,22 @@ impl BrowserClient {
         Ok(Self { client })
     }
 
+    /// Like [`BrowserClient::connect`], with an explicit event-channel capacity.
+    ///
+    /// A browser-level connection carries the events of every attached tab
+    /// through one ring, so sessions driving many tabs at once should raise it.
+    /// See [`crate::client::EVENT_CHANNEL_CAPACITY`].
+    pub async fn connect_with_capacity(
+        host: &str,
+        default_timeout: Duration,
+        capacity: usize,
+    ) -> CdpResult<Self> {
+        let ws_url = get_browser_websocket_url(host).await?;
+        let client = CdpClient::connect_with_capacity(&ws_url, default_timeout, capacity).await?;
+
+        Ok(Self { client })
+    }
+
     /// Wraps an existing browser-level connection.
     ///
     /// The client must already be connected to a browser endpoint; a

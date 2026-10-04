@@ -19,6 +19,18 @@ use tracing::{debug, error, trace};
 
 type CdpWebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
+/// Capacity of the event broadcast ring of a single connection.
+///
+/// One ring carries the events of **every** domain of **every** attached tab,
+/// so it must be sized for the whole browser session rather than for one page.
+/// A subscriber that falls behind the ring loses the skipped events and is
+/// told so via [`crate::error::CdpError::Lagged`]; nothing is silently
+/// discarded without notice.
+///
+/// Overridable per connection with [`CdpClient::connect_with_capacity`] when a
+/// session drives many tabs at once.
+pub const EVENT_CHANNEL_CAPACITY: usize = 4096;
+
 /// Commands awaiting the response that carries their `id`.
 ///
 /// One map per connection, shared with the reader task: a browser-level
@@ -54,12 +66,27 @@ impl CdpClient {
     /// [`crate::browser::BrowserClient`] uses to open the browser-level
     /// connection.
     pub async fn connect(ws_url: &str, default_timeout: Duration) -> CdpResult<Self> {
+        Self::connect_with_capacity(ws_url, default_timeout, EVENT_CHANNEL_CAPACITY).await
+    }
+
+    /// Like [`CdpClient::connect`], with an explicit event-channel capacity.
+    ///
+    /// Raise `capacity` for browser-level connections driving many tabs at
+    /// once: the ring is shared by every tab and domain of the connection, so
+    /// a capacity sized for one page will overrun once the tab count grows.
+    ///
+    /// `capacity` of `0` is treated as `1`, the smallest usable ring.
+    pub async fn connect_with_capacity(
+        ws_url: &str,
+        default_timeout: Duration,
+        capacity: usize,
+    ) -> CdpResult<Self> {
         let (ws_stream, _) = connect_async(ws_url).await?;
         let (ws_sink, ws_source) = ws_stream.split();
 
         let pending_requests: PendingRequests = Arc::new(Mutex::new(HashMap::new()));
         let (command_tx, command_rx) = mpsc::unbounded_channel::<String>();
-        let (event_tx, _) = broadcast::channel(128);
+        let (event_tx, _) = broadcast::channel(effective_capacity(capacity));
         let is_alive = Arc::new(AtomicBool::new(true));
 
         tokio::spawn(write_commands(ws_sink, command_rx));
@@ -181,6 +208,15 @@ impl CdpClient {
             }
         }
     }
+}
+
+/// Applies the event-channel capacity policy.
+///
+/// `tokio::sync::broadcast` panics on a zero-capacity channel, and a ring of
+/// one is the smallest thing that can carry a single event, so `0` degrades to
+/// `1` instead of failing the connection.
+fn effective_capacity(capacity: usize) -> usize {
+    capacity.max(1)
 }
 
 /// Writer task: drains the command queue onto the socket.
@@ -428,6 +464,9 @@ mod tests {
         println!("✅ Event correctly filtered and received by domain subscriber");
     }
 
+    /// A subscriber that falls behind the shared event ring must be told, with
+    /// a typed `Lagged` carrying how many events it missed, so it can rebuild
+    /// whatever cache those events were maintaining.
     #[tokio::test]
     async fn test_broadcast_lagged_error() {
         // Setup with a very small broadcast buffer (only 4 messages allowed)
@@ -438,8 +477,8 @@ mod tests {
 
         let mut page_events = client.on_domain("Page");
 
-        // Flood the channel with 10 events without reading them
-        // This will exceed the buffer capacity of 4
+        // Flood the channel with 10 events without reading them.
+        // This will exceed the buffer capacity of 4.
         for i in 0..10 {
             let mock_event = WsResponse {
                 method: Some("Page.event".to_string()),
@@ -449,29 +488,42 @@ mod tests {
             let _ = event_tx.send(mock_event);
         }
 
-        // Try to read from the subscriber
-        // Since we sent 10 messages but the buffer is 4, we are "lagged"
         let result = page_events.next().await;
 
-        // The first call to next() after a lag should return an Error
-        // specifically a CdpError that wraps broadcast::error::RecvError::Lagged
         match result {
-            Some(Err(CdpError::InternalError(msg))) => {
-                // Your CdpError::from implementation for RecvError likely formats it as a string
-                assert!(msg.contains("channel overflow") || msg.contains("lagged"));
-                println!("✅ Correctly detected lagged subscriber (buffer overflow)");
+            Some(Err(CdpError::Lagged { skipped })) => {
+                assert_eq!(
+                    skipped, 6,
+                    "10 events sent into a 4-slot ring must report 6 dropped"
+                );
             }
             Some(Ok(event)) => {
                 panic!(
-                    "❌ Expected a Lagged error, but received a successful event: {:?}",
+                    "Expected a Lagged error, but received an event: {:?}",
                     event
                 );
             }
-            None => panic!("❌ Stream closed unexpectedly"),
-            _ => {}
+            Some(Err(other)) => {
+                panic!("Expected CdpError::Lagged, but received {:?}", other);
+            }
+            None => panic!("Stream closed unexpectedly"),
         }
 
-        println!("✅ Buffer overflow test passed: Oldest messages were dropped as expected");
+        // The subscriber must survive the lag and keep forwarding what it did
+        // not miss, otherwise there is nothing left to resynchronise from. The
+        // channel stays open (the client holds a sender), so read exactly the
+        // 4 events still in the ring rather than draining to exhaustion.
+        let mut delivered = 0;
+        while delivered < 4 {
+            match page_events.next().await {
+                Some(Ok(_)) => delivered += 1,
+                other => panic!("unexpected item while draining: {:?}", other),
+            }
+        }
+        assert_eq!(
+            delivered, 4,
+            "the 4 events still in the ring must remain readable after a lag"
+        );
     }
 
     #[tokio::test]
@@ -599,5 +651,40 @@ mod tests {
         ids.sort_unstable();
         ids.dedup();
         assert_eq!(ids.len(), 3, "each command must get a distinct id");
+    }
+
+    #[test]
+    fn effective_capacity_clamps_zero_to_one() {
+        assert_eq!(effective_capacity(0), 1, "a zero ring would panic tokio");
+        assert_eq!(effective_capacity(1), 1);
+        assert_eq!(effective_capacity(128), 128);
+    }
+
+    #[test]
+    fn default_event_capacity_is_roomier_than_a_single_page_would_need() {
+        // The ring is shared by every tab and domain of a connection. The old
+        // hardcoded 128 was sized for one page and overran as soon as a session
+        // drove several tabs, dropping events with no way to recover them.
+        const {
+            assert!(
+                EVENT_CHANNEL_CAPACITY >= 1024,
+                "EVENT_CHANNEL_CAPACITY is too small for a multi-tab connection"
+            );
+        };
+    }
+
+    /// The typed lag signal is what a consumer keys its resynchronisation on,
+    /// so the error must keep carrying the number of dropped events.
+    #[test]
+    fn lagged_error_carries_the_dropped_event_count() {
+        let err = CdpError::Lagged { skipped: 7 };
+        assert!(
+            err.to_string().contains('7'),
+            "the count must survive Display, got: {err}"
+        );
+        match err {
+            CdpError::Lagged { skipped } => assert_eq!(skipped, 7),
+            other => panic!("expected Lagged, got {other:?}"),
+        }
     }
 }
