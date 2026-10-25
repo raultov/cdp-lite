@@ -14,7 +14,8 @@ use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async_with_config};
 use tracing::{debug, error, trace};
 
 type CdpWebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -30,6 +31,22 @@ type CdpWebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 /// Overridable per connection with [`CdpClient::connect_with_capacity`] when a
 /// session drives many tabs at once.
 pub const EVENT_CHANNEL_CAPACITY: usize = 4096;
+
+/// Largest WebSocket message (and frame) a connection accepts: 256 MiB.
+///
+/// Chrome sends each CDP message in a single frame, so tungstenite's default
+/// 16 MiB frame limit closed the connection on any larger reply (a huge
+/// `Runtime.evaluate` result, a big page's HTML, a long script source), and
+/// every later command failed with `Disconnected`. 256 MiB is what Puppeteer
+/// accepts.
+pub const MAX_MESSAGE_SIZE: usize = 256 << 20;
+
+/// The WebSocket settings of every connection (see [`MAX_MESSAGE_SIZE`]).
+fn websocket_config() -> WebSocketConfig {
+    WebSocketConfig::default()
+        .max_message_size(Some(MAX_MESSAGE_SIZE))
+        .max_frame_size(Some(MAX_MESSAGE_SIZE))
+}
 
 /// Commands awaiting the response that carries their `id`.
 ///
@@ -81,7 +98,8 @@ impl CdpClient {
         default_timeout: Duration,
         capacity: usize,
     ) -> CdpResult<Self> {
-        let (ws_stream, _) = connect_async(ws_url).await?;
+        let (ws_stream, _) =
+            connect_async_with_config(ws_url, Some(websocket_config()), false).await?;
         let (ws_sink, ws_source) = ws_stream.split();
 
         let pending_requests: PendingRequests = Arc::new(Mutex::new(HashMap::new()));
@@ -341,6 +359,42 @@ mod tests {
             default_timeout,
             is_alive: Arc::new(AtomicBool::new(true)),
         }
+    }
+
+    /// A reply over tungstenite's default 16 MiB frame limit (a huge
+    /// `Runtime.evaluate` result, a big page or script source) reaches the
+    /// caller instead of closing the connection.
+    #[tokio::test]
+    async fn test_reply_over_16_mib_is_received() {
+        use tokio::net::TcpListener;
+        // Given a server that answers any command with a 20 MiB reply in one frame
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let big = "x".repeat(20 << 20);
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let Some(Ok(Message::Text(command))) = socket.next().await else {
+                return;
+            };
+            let id = serde_json::from_str::<Value>(&command).unwrap()["id"].clone();
+            let reply = serde_json::json!({"id": id, "result": {"value": big}});
+            socket.send(Message::text(reply.to_string())).await.unwrap();
+            let _ = socket.next().await;
+        });
+        let client = CdpClient::connect(&format!("ws://{address}"), Duration::from_secs(10))
+            .await
+            .unwrap();
+
+        // When a command gets that reply
+        let reply = client
+            .send_raw_command("Runtime.evaluate", serde_json::json!({}))
+            .await;
+
+        // Then it arrives whole
+        let reply = reply.expect("the 20 MiB reply should arrive");
+        let value = reply.result.unwrap()["value"].as_str().unwrap().len();
+        assert_eq!(value, 20 << 20);
     }
 
     #[tokio::test]

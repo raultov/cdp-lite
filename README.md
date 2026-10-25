@@ -135,6 +135,13 @@ tokio::spawn(async move {
 });
 ```
 
+### Large messages
+
+A connection accepts WebSocket messages up to `client::MAX_MESSAGE_SIZE`
+(256 MiB, as Puppeteer). Chrome sends each CDP message in one frame, and the
+WebSocket library's default 16 MiB frame limit used to close the connection on
+a larger reply (a huge `Runtime.evaluate` result, a big page or script source).
+
 ### Event loss and `CdpError::Lagged`
 
 One connection carries the events of every domain of every attached tab through
