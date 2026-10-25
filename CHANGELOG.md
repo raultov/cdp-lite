@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-10-25
+
+### Fixed
+
+- A CDP message over 16 MiB (a huge `Runtime.evaluate` result, a big page's
+  HTML, a long script source) closed the connection: tungstenite's default
+  frame limit is 16 MiB and Chrome sends each message in one frame, so the
+  reply never arrived and every later command failed with `Disconnected`.
+  Connections now accept messages and frames up to 256 MiB.
+
+### Added
+
+- `client::MAX_MESSAGE_SIZE` (256 MiB), the largest message a connection
+  accepts.
+
 ## [0.3.0] - 2026-10-04
 
 ### Added
@@ -109,7 +124,8 @@ First published release.
 - Usage examples: `simple`, `filter_domains`, `runtime_usage`,
   `breakpoints_usage`, `proxy_usage`.
 
-[Unreleased]: https://github.com/raultov/cdp-lite/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/raultov/cdp-lite/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/raultov/cdp-lite/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/raultov/cdp-lite/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/raultov/cdp-lite/compare/v0.1.3...v0.2.0
 [0.1.3]: https://github.com/raultov/cdp-lite/compare/v0.1.1...v0.1.3
