@@ -59,6 +59,19 @@ impl Tab {
             .await
     }
 
+    /// Writes a CDP command to this tab without waiting for its reply.
+    ///
+    /// Mirrors [`CdpClient::send_raw_command_no_reply`], with the `sessionId`
+    /// filled in.
+    pub fn send_raw_command_no_reply<P: Serialize>(
+        &self,
+        method: &str,
+        params: P,
+    ) -> CdpResult<()> {
+        self.client
+            .send_raw_command_to_session_no_reply(&self.session_id, method, params)
+    }
+
     /// Streams this tab's events for a single domain, e.g. `"Page"`.
     pub fn on_domain(&self, domain: &'static str) -> EventFilter {
         self.client.on_domain_for_session(domain, &self.session_id)

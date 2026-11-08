@@ -165,6 +165,47 @@ impl CdpClient {
             .await
     }
 
+    /// Writes a command without waiting for, or keeping a slot for, its reply.
+    ///
+    /// The command is queued for the socket by the time this returns. Its
+    /// reply, if Chrome ever sends one, is discarded as an unknown id. Use it
+    /// for commands whose outcome does not matter or may never arrive, e.g. a
+    /// command sent to a page blocked by a JavaScript dialog or a debugger
+    /// pause, which Chrome only runs once the page answers again.
+    pub fn send_raw_command_no_reply<P: Serialize>(
+        &self,
+        method: &str,
+        params: P,
+    ) -> CdpResult<()> {
+        self.send_no_reply(method, params, None)
+    }
+
+    /// Same as [`CdpClient::send_raw_command_no_reply`], scoped to one attached
+    /// tab.
+    pub fn send_raw_command_to_session_no_reply<P: Serialize>(
+        &self,
+        session_id: &str,
+        method: &str,
+        params: P,
+    ) -> CdpResult<()> {
+        self.send_no_reply(method, params, Some(session_id.to_string()))
+    }
+
+    fn send_no_reply<P: Serialize>(
+        &self,
+        method: &str,
+        params: P,
+        session_id: Option<String>,
+    ) -> CdpResult<()> {
+        self.ensure_alive()?;
+        self.write_command(&WsCommand {
+            id: self.next_id.fetch_add(1, Ordering::SeqCst),
+            method: method.to_string(),
+            params: Some(params),
+            session_id,
+        })
+    }
+
     fn ensure_alive(&self) -> CdpResult<()> {
         if self.is_alive.load(Ordering::SeqCst) {
             Ok(())
@@ -504,6 +545,44 @@ mod tests {
         assert!(matches!(result, Err(CdpError::InternalError(_))));
         assert!(client.pending_requests.lock().unwrap().is_empty());
     }
+
+    /// A fire-and-forget command is written but never registers a reply slot.
+    #[tokio::test]
+    async fn test_no_reply_command_is_written_without_a_slot() {
+        let (command_tx, mut command_rx) = mpsc::unbounded_channel();
+        let client = test_client(command_tx, broadcast::channel(1).0, Duration::from_secs(60));
+
+        client
+            .send_raw_command_no_reply("Emulation.clearDeviceMetricsOverride", NoReplyParams {})
+            .unwrap();
+        client
+            .send_raw_command_to_session_no_reply("SESSION-7", "Page.enable", NoReplyParams {})
+            .unwrap();
+
+        let first: Value = serde_json::from_str(&command_rx.try_recv().unwrap()).unwrap();
+        let second: Value = serde_json::from_str(&command_rx.try_recv().unwrap()).unwrap();
+        assert_eq!(first["method"], "Emulation.clearDeviceMetricsOverride");
+        assert!(first.get("sessionId").is_none());
+        assert_eq!(second["method"], "Page.enable");
+        assert_eq!(second["sessionId"], "SESSION-7");
+        assert_ne!(first["id"], second["id"], "ids stay unique");
+        assert!(client.pending_requests.lock().unwrap().is_empty());
+    }
+
+    /// A fire-and-forget command on a dead connection fails fast.
+    #[test]
+    fn test_no_reply_command_on_dead_connection_is_disconnected() {
+        let (command_tx, _command_rx) = mpsc::unbounded_channel();
+        let client = test_client(command_tx, broadcast::channel(1).0, Duration::from_secs(1));
+        client.is_alive.store(false, Ordering::SeqCst);
+
+        let result = client.send_raw_command_no_reply("Page.enable", NoReplyParams {});
+
+        assert!(matches!(result, Err(CdpError::Disconnected)));
+    }
+
+    #[derive(Serialize)]
+    struct NoReplyParams {}
 
     #[tokio::test]
     async fn test_protocol_error_mapping() {
