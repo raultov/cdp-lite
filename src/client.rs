@@ -165,15 +165,30 @@ impl CdpClient {
             .await
     }
 
+    fn ensure_alive(&self) -> CdpResult<()> {
+        if self.is_alive.load(Ordering::SeqCst) {
+            Ok(())
+        } else {
+            Err(CdpError::Disconnected)
+        }
+    }
+
+    /// Serializes a command and hands it to the writer task.
+    fn write_command<P: Serialize>(&self, cmd: &WsCommand<P>) -> CdpResult<()> {
+        let json_payload = serde_json::to_string(cmd)?;
+        self.command_tx.send(json_payload).map_err(|e| {
+            self.is_alive.store(false, Ordering::SeqCst);
+            CdpError::InternalError(format!("Failed to send command to writer task: {}", e))
+        })
+    }
+
     async fn dispatch<P: Serialize>(
         &self,
         method: &str,
         params: P,
         session_id: Option<String>,
     ) -> CdpResult<WsResponse> {
-        if !self.is_alive.load(Ordering::SeqCst) {
-            return Err(CdpError::Disconnected);
-        }
+        self.ensure_alive()?;
 
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = oneshot::channel();
@@ -186,18 +201,18 @@ impl CdpClient {
             })?;
             map.insert(id, tx);
         }
+        // From here on, every exit (error, timeout, or the caller dropping this
+        // future) frees the reply slot.
+        let _slot = PendingSlot {
+            pending_requests: &self.pending_requests,
+            id,
+        };
 
-        let cmd = WsCommand {
+        self.write_command(&WsCommand {
             id,
             method: method.to_string(),
             params: Some(params),
             session_id,
-        };
-
-        let json_payload = serde_json::to_string(&cmd)?;
-        self.command_tx.send(json_payload).map_err(|e| {
-            self.is_alive.store(false, Ordering::SeqCst);
-            CdpError::InternalError(format!("Failed to send command to writer task: {}", e))
         })?;
 
         match timeout(self.default_timeout, rx).await {
@@ -214,16 +229,29 @@ impl CdpClient {
                 Ok(response)
             }
             Ok(Err(_)) => Err(CdpError::Disconnected),
-            Err(_) => {
-                if let Ok(mut map) = self.pending_requests.lock() {
-                    map.remove(&id);
-                }
+            Err(_) => Err(CdpError::Timeout {
+                method: method.to_string(),
+                timeout: self.default_timeout,
+            }),
+        }
+    }
+}
 
-                Err(CdpError::Timeout {
-                    method: method.to_string(),
-                    timeout: self.default_timeout,
-                })
-            }
+/// Owns a command's entry in [`PendingRequests`] and removes it on drop.
+///
+/// Without it, a command future dropped before its reply (a lost `select!`
+/// branch, an aborted task, a shorter outer timeout) left its sender in the
+/// map until Chrome answered, or forever if it never did. Once the reply has
+/// been routed the entry is already gone and the removal is a no-op.
+struct PendingSlot<'a> {
+    pending_requests: &'a PendingRequests,
+    id: u64,
+}
+
+impl Drop for PendingSlot<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut map) = self.pending_requests.lock() {
+            map.remove(&self.id);
         }
     }
 }
@@ -422,6 +450,59 @@ mod tests {
         let pending = client.pending_requests.lock().unwrap();
         assert_eq!(pending.len(), 0, "❌ ID was not removed from HashMap");
         println!("✅ HashMap is clean, no memory leaks");
+    }
+
+    /// A command future dropped before its reply (here: polled once under a
+    /// zero timeout, as a lost `select!` branch would be) must free its reply
+    /// slot, and a reply arriving later must be ignored.
+    #[tokio::test]
+    async fn test_dropped_command_future_frees_its_slot() {
+        let (command_tx, mut command_rx) = mpsc::unbounded_channel();
+        let (event_tx, _) = broadcast::channel(1);
+        let client = test_client(command_tx, event_tx.clone(), Duration::from_secs(60));
+
+        // Given a command that is written and then abandoned
+        let outcome = timeout(
+            Duration::ZERO,
+            client.send_raw_command("Page.navigate", serde_json::json!({})),
+        )
+        .await;
+        assert!(outcome.is_err(), "the zero timeout should win");
+
+        // Then it reached the writer, and its slot is gone
+        let payload = command_rx
+            .try_recv()
+            .expect("the command should be written");
+        let id = serde_json::from_str::<Value>(&payload).unwrap()["id"]
+            .as_u64()
+            .unwrap();
+        assert!(
+            client.pending_requests.lock().unwrap().is_empty(),
+            "a dropped command future must not leave its sender behind"
+        );
+
+        // And its late reply is discarded without error
+        let late = WsResponse {
+            id: Some(id),
+            ..Default::default()
+        };
+        route_message(late, &client.pending_requests, &event_tx, "{}").unwrap();
+        assert!(client.pending_requests.lock().unwrap().is_empty());
+    }
+
+    /// The reply slot is also freed when the command never reaches the writer.
+    #[tokio::test]
+    async fn test_failed_write_frees_its_slot() {
+        let (command_tx, command_rx) = mpsc::unbounded_channel();
+        drop(command_rx);
+        let client = test_client(command_tx, broadcast::channel(1).0, Duration::from_secs(60));
+
+        let result = client
+            .send_raw_command("Page.enable", serde_json::json!({}))
+            .await;
+
+        assert!(matches!(result, Err(CdpError::InternalError(_))));
+        assert!(client.pending_requests.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
