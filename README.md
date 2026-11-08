@@ -110,6 +110,7 @@ docs.close().await?;    // or browser.close_tab(id)
 | `new_tab(url)` / `close_tab(target_id)` | Open and close tabs |
 | `set_discover_targets(bool)` | Emit `Target.targetCreated` / `targetDestroyed` events |
 | `Tab::send_raw_command(..)` | Send a command to that tab only |
+| `Tab::send_raw_command_no_reply(..)` | Write a command to that tab without waiting for its reply |
 | `Tab::on_domain(d)` / `Tab::events()` | Stream that tab's events |
 | `Tab::activate()` / `close()` / `detach()` | Focus, close, or stop listening |
 
@@ -141,6 +142,22 @@ A connection accepts WebSocket messages up to `client::MAX_MESSAGE_SIZE`
 (256 MiB, as Puppeteer). Chrome sends each CDP message in one frame, and the
 WebSocket library's default 16 MiB frame limit used to close the connection on
 a larger reply (a huge `Runtime.evaluate` result, a big page or script source).
+
+### Fire-and-forget commands and cancellation
+
+Dropping a command future before its reply arrives (a lost `tokio::select!`
+branch, an aborted task, an outer timeout) is safe: its reply slot is freed
+right away and a late reply is discarded.
+
+When you do not need the reply at all — for instance a command sent to a page
+blocked by a JavaScript dialog or a debugger pause, which Chrome only runs once
+the page answers again — use `send_raw_command_no_reply` (also
+`send_raw_command_to_session_no_reply` and `Tab::send_raw_command_no_reply`).
+It queues the command and returns immediately, without registering a reply slot:
+
+```rust
+tab.send_raw_command_no_reply("Emulation.clearDeviceMetricsOverride", NoParams)?;
+```
 
 ### Event loss and `CdpError::Lagged`
 
