@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-11-08
+
+### Fixed
+
+- A command future dropped before its reply (a lost `select!` branch, an
+  aborted task, an outer timeout shorter than the default one) left its reply
+  slot in the pending-request map until Chrome answered, or for the life of the
+  connection if it never did. The slot is now freed whenever the future ends,
+  including when the command could not be written (#2).
+
+### Added
+
+- `CdpClient::send_raw_command_no_reply`,
+  `CdpClient::send_raw_command_to_session_no_reply` and
+  `Tab::send_raw_command_no_reply`: write a command without registering a reply
+  slot; a reply, if any, is discarded.
+
 ## [0.3.1] - 2026-10-25
 
 ### Fixed
@@ -124,7 +141,8 @@ First published release.
 - Usage examples: `simple`, `filter_domains`, `runtime_usage`,
   `breakpoints_usage`, `proxy_usage`.
 
-[Unreleased]: https://github.com/raultov/cdp-lite/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/raultov/cdp-lite/compare/v0.3.2...HEAD
+[0.3.2]: https://github.com/raultov/cdp-lite/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/raultov/cdp-lite/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/raultov/cdp-lite/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/raultov/cdp-lite/compare/v0.1.3...v0.2.0
